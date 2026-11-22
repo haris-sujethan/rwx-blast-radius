@@ -17,13 +17,15 @@ MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.bin"))
 COSTS = os.environ.get("BR_COSTS", os.path.join(HERE, "costs.json"))
 STAGES = os.environ.get("BR_STAGES", "/app/stages.json")
 MIRROR = os.environ.get("BR_MIRROR", "/tmp/m")
-WALL_BUDGET = float(os.environ.get("BR_WALL", "150"))
+WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.3"))
 CHEAP_MAX = float(os.environ.get("BR_CHEAP_MAX", "1.5"))
+RUN_CAP = float(os.environ.get("BR_RUN_CAP", "20"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 
 T0 = time.monotonic()
+STATE = {"commits": [], "printed": set(), "cands": {}, "dur_ms": None, "ntests": 0}
 
 
 def log(*a):
@@ -66,6 +68,33 @@ def pack_cost(nums, dur_ms):
 # ---------------------------------------------------------------------------------------------
 
 
+def emit_line(cid, nums):
+    if cid in STATE["printed"]:
+        return
+    workers = pack(nums, STATE["dur_ms"])
+    line = json.dumps({"commit": cid, "workers": workers}, separators=(",", ":"))
+    STATE["printed"].add(cid)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def fallback():
+    """Every commit must get exactly one line, whatever happened."""
+    for cid in STATE["commits"]:
+        if cid in STATE["printed"]:
+            continue
+        nums = STATE["cands"].get(cid)
+        if nums is None:
+            nums = range(STATE["ntests"])
+        try:
+            emit_line(cid, nums)
+        except Exception:  # noqa: BLE001
+            line = json.dumps({"commit": cid, "workers": [list(range(STATE["ntests"]))]})
+            STATE["printed"].add(cid)
+            sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
 def main():
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ntests = len(tests)
@@ -76,6 +105,7 @@ def main():
         tid[t["number"]] = t["id"]
     commits_dir = os.path.join(DATA, "commits")
     commits = sorted(f[:-6] for f in os.listdir(commits_dir) if f.endswith(".patch"))
+    STATE["commits"] = commits
     log(f"{len(commits)} commits, {ntests} tests")
 
     from candidates import MapDB, bits, select
@@ -93,14 +123,9 @@ def main():
         c = costs.get(t["id"])
         est_cpu[t["number"]] = (c if c is not None else t["seconds"]) * CPU_SCALE
 
-    out_lines = []
-
-    def emit(cid, nums):
-        workers = pack(nums, dur_ms)
-        line = json.dumps({"commit": cid, "workers": workers}, separators=(",", ":"))
-        out_lines.append(line)
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+    STATE["dur_ms"] = dur_ms
+    STATE["ntests"] = ntests
+    emit = emit_line
 
     jobs = []  # (cid, files, run_nums, blind_nums)
     for cid in commits:
@@ -117,6 +142,7 @@ def main():
             log(f"{cid}: analysis failed {e!r}; running everything blind")
             emit(cid, list(range(ntests)))
             continue
+        STATE["cands"][cid] = cands
         cheap = {n for n in cands if est_cpu[n] <= CHEAP_MAX}
         expensive = cands - cheap
         log(f"{cid}: cands={len(cands)} cheap={len(cheap)} exp={sorted(expensive)} "
@@ -168,17 +194,22 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
 
     pending = sorted(((level(sel.files), cid, sel, cheap, exp) for cid, sel, cheap, exp in jobs),
                      key=lambda j: j[0])
-    cur_level = 0
-    for lvl, cid, sel, cheap, expensive in pending:
-        while cur_level < lvl:
-            runner.preload(stages[cur_level]["modules"])
-            cur_level += 1
+    def serve(cid, sel, cheap, expensive, lvl):
         loaded = runner.loaded_files(MIRROR + os.sep)
         purge = any(f in loaded for f in sel.files)
-        if time.monotonic() - T0 > WALL_BUDGET:
+        now = time.monotonic()
+        if now - T0 > WALL_BUDGET - 3:
             log(f"{cid}: out of time, blind")
             emit(cid, cheap | expensive)
-            continue
+            return
+        est_cheap = sum(est_cpu[n] for n in cheap)
+        blind_all = pack_cost(cheap | expensive, dur_ms) / 1000
+        if est_cheap > min(blind_all + 1.0, RUN_CAP):
+            log(f"{cid}: running cheap tests ({est_cheap:.1f}s) costs more than including "
+                f"everything ({blind_all:.1f}s); blind")
+            emit(cid, cheap | expensive)
+            return
+        deadline = min(T0 + WALL_BUDGET, now + max(15.0, 3 * est_cheap + 10))
         files = dict(sel.files)
         files.update(sel.instr)
         mirror.apply(files)
@@ -218,7 +249,8 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             unrun = set()
             if cheap:
                 res = runner.run_tests(spec_of(cheap), purge=purge, stop_cb=stop_cb,
-                                       timeouts={n: max(3.0, est_cpu[n] * 4 + 2) for n in cheap})
+                                       timeouts={n: max(3.0, est_cpu[n] * 4 + 2) for n in cheap},
+                                       deadline=deadline)
                 failing |= {n for n, f in res.items() if f}
                 unrun = cheap - set(res)
                 for n in cheap:
@@ -234,7 +266,8 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 blind |= b
                 if run_b:
                     res = runner.run_tests(spec_of(run_b), purge=purge,
-                                           timeouts={n: max(3.0, est_cpu[n] * 4 + 2) for n in run_b})
+                                           timeouts={n: max(3.0, est_cpu[n] * 4 + 2) for n in run_b},
+                                           deadline=deadline)
                     failing |= {n for n, f in res.items() if f} | {n for n in run_b if n not in res}
         finally:
             mirror.restore()
@@ -246,11 +279,37 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             f"top={sorted(((round(runner.CPU_LOG.get(n, 0), 2), tid[n].split('::')[-1]) for n in cheap | run_b), reverse=True)[:3]}")
         emit(cid, failing | blind)
 
+    cur_level = 0
+    for lvl, cid, sel, cheap, expensive in pending:
+        while cur_level < lvl:
+            runner.preload(stages[cur_level]["modules"])
+            cur_level += 1
+        try:
+            serve(cid, sel, cheap, expensive, lvl)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+
+            log(f"{cid}: execution failed {e!r}; blind")
+            traceback.print_exc(file=sys.stderr)
+            try:
+                mirror.restore()
+            except Exception:  # noqa: BLE001
+                pass
+            emit(cid, cheap | expensive)
+
 
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:  # noqa: BLE001
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
     finally:
+        try:
+            fallback()
+        except BaseException:  # noqa: BLE001
+            pass
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import os
 import select
+import shutil
 import signal
 import sys
 import time
@@ -56,28 +57,39 @@ class Mirror:
                     os.symlink(e.path, os.path.join(self.dst, r))
 
     def _materialize_dir(self, rel_dir):
-        """Make sure rel_dir is a real directory in the mirror (fixtures dirs are symlinked)."""
+        """Make every component of rel_dir a real directory inside the mirror (fixture
+        directories are mirrored as symlinks to the read-only source)."""
         if not rel_dir:
             return
-        d = os.path.join(self.dst, rel_dir)
-        if os.path.islink(d):
-            self._materialize_dir(os.path.dirname(rel_dir))
-            target = os.readlink(d)
-            os.unlink(d)
-            os.makedirs(d)
-            self.changed.append((rel_dir, "dirlink", target))
-            for name in os.listdir(target):
-                os.symlink(os.path.join(target, name), os.path.join(d, name))
-        elif not os.path.exists(d):
-            self._materialize_dir(os.path.dirname(rel_dir))
-            os.makedirs(d)
-            self.changed.append((rel_dir, "newdir", None))
+        cur = ""
+        for part in rel_dir.split("/"):
+            cur = os.path.join(cur, part) if cur else part
+            d = os.path.join(self.dst, cur)
+            if os.path.islink(d):
+                target = os.readlink(d)
+                os.unlink(d)
+                os.mkdir(d)
+                self.changed.append((cur, "dirlink", target))
+                if os.path.isdir(target):
+                    for name in os.listdir(target):
+                        os.symlink(os.path.join(target, name), os.path.join(d, name))
+            elif not os.path.exists(d):
+                os.mkdir(d)
+                self.changed.append((cur, "newdir", None))
 
     def apply(self, files):
         """files: rel -> new text or None (delete)."""
+        real_dst = os.path.realpath(self.dst)
         for rel, text in files.items():
+            rel = os.path.normpath(rel)
+            if rel.startswith("..") or os.path.isabs(rel):
+                continue
             self._materialize_dir(os.path.dirname(rel))
             p = os.path.join(self.dst, rel)
+            if not os.path.realpath(os.path.dirname(p)).startswith(real_dst):
+                raise RuntimeError(f"refusing to write outside the mirror: {rel}")
+            if os.path.isdir(p) and not os.path.islink(p):
+                continue
             existed = os.path.lexists(p)
             target = os.readlink(p) if existed and os.path.islink(p) else None
             if existed:
@@ -97,7 +109,11 @@ class Mirror:
                     os.symlink(target, p)
             elif kind == "dirlink":
                 for name in os.listdir(p):
-                    os.unlink(os.path.join(p, name))
+                    q = os.path.join(p, name)
+                    if os.path.islink(q) or not os.path.isdir(q):
+                        os.unlink(q)
+                    else:
+                        shutil.rmtree(q, ignore_errors=True)
                 os.rmdir(p)
                 os.symlink(target, p)
             elif kind == "newdir":
@@ -293,7 +309,7 @@ def _child_run(tests, wfd, purge, per_test_timeout):
 GC_THRESHOLD = tuple(int(x) for x in os.environ.get("BR_GC", "50000,50,100").split(","))
 
 
-def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None):
+def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None, deadline=None):
     """Fork a child of the current process to run tests. Returns {number: failed_bool}.
 
     tests: list of (number, module, cls, method). Tests whose result never arrives count as
@@ -334,6 +350,12 @@ def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None)
                 wait = max(0.05, current_start + limit - now)
             else:
                 wait = 30
+            if deadline is not None:
+                if now > deadline:
+                    os.kill(pid, signal.SIGKILL)
+                    stopped = True
+                    break
+                wait = min(wait, max(0.05, deadline - now))
             ready, _, _ = select.select([r], [], [], wait)
             if not ready:
                 if current is not None and time.monotonic() - current_start > \
