@@ -49,8 +49,19 @@ def child(test, outpath):
             s.add(line if code.co_flags & 1 else -line)
         return mon.DISABLE
 
+    def on_start(code, offset):
+        # one-line functions/lambdas never raise a LINE event: record their first line on entry
+        fn = code.co_filename
+        if fn.startswith(PREFIX) and code.co_flags & 1:
+            s = state["cur"].get(fn)
+            if s is None:
+                s = state["cur"][fn] = set()
+            s.add(code.co_firstlineno)
+        return mon.DISABLE
+
     mon.register_callback(tool, mon.events.LINE, on_line)
-    mon.set_events(tool, mon.events.LINE)
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
     opens = set()
     import builtins

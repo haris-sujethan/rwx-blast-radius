@@ -31,15 +31,23 @@ SAFE_FIXTURES = ("tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tp
 
 
 ENGINE = ("sqlglot/executor/", "sqlglot/planner.py")
+ENGINE_CLASS_MODULES = ("sqlglot.dialects.dialect", "sqlglot.generators.python", "sqlglot.parsers.base",
+                        "sqlglot.dialects.python")
+DIALECT_MODULES = ("sqlglot.dialects.", "sqlglot.generators.", "sqlglot.parsers.", "sqlglot.typing.",
+                   "sqlglot.tokenizers.")
 
 
-def safe_for(files, req=None, execlines=None):
+def safe_for(files, req=None, execlines=None, primary_classes=None, test_bit=-1):
     """True when the engine (planner + executor run) cannot behave differently for an
     unchanged fingerprint: engine files untouched and, given the recorded lines the engine
     phase executes, no changed line runs inside it."""
     for f in files:
         if f.startswith(SAFE_FIXTURES):
-            continue  # the fingerprint re-reads the (patched) fixture rows
+            if f.endswith(".sql"):
+                continue  # the fingerprint re-reads the (patched) fixture rows
+            return False  # TPC table data
+        if f.startswith("tests/fixtures/"):
+            continue  # other fixtures: never read by the TPC executor tests
         if not f.startswith("sqlglot/"):
             return False
         if f.startswith(ENGINE):
@@ -47,8 +55,16 @@ def safe_for(files, req=None, execlines=None):
         if execlines is None and f.startswith(UNSAFE_PREFIXES):
             return False
     if execlines is not None:
-        if req is None or req["full"] or req["classes"] or req.get("conj"):
+        if req is None or req["full"] & test_bit:
             return False
+        classes = primary_classes if primary_classes is not None else (
+            set(req["classes"]) | {c for c, _ in req.get("conj", ())})
+        for key in classes:
+            mod = key.split(":", 1)[0]
+            # the engine uses expression classes and the base/python generator machinery;
+            # another dialect's classes cannot reach it
+            if mod.startswith(ENGINE_CLASS_MODULES) or not mod.startswith(DIALECT_MODULES):
+                return False
         for rel, lines in req["lines"].items():
             el = execlines.get(rel)
             if el and not el.isdisjoint(lines):

@@ -17,6 +17,8 @@ import time
 
 DEVNULL = os.open(os.devnull, os.O_RDWR)
 CPU_LOG = {}
+KILL_GRACE = float(os.environ.get("BR_KILL_GRACE", "0.5"))
+IDLE_LIMIT = float(os.environ.get("BR_IDLE_LIMIT", "8"))
 CUR_FILTER = None
 FAIL_FAST = os.environ.get("BR_FAIL_FAST", "1") == "1"
 WM_LOG = {}
@@ -214,6 +216,12 @@ def wrap_helpers():
     h._br_wrapped = True
 
 
+PRESETUP_DONE = False
+# data the zygote's executor setup read: a patch touching it needs a fresh test module
+PRESETUP_PREFIXES = ("tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/",
+                     "tests/helpers.py", "tests/test_executor.py")
+
+
 def presetup_executor():
     """Run TestExecutor.setUpClass once in the zygote (TPC data loading), with single-threaded
     duckdb connections so forked children can use them; children skip it."""
@@ -238,11 +246,15 @@ def presetup_executor():
         te.TestExecutor.setUpClass = classmethod(lambda cls: None)
         te.TestExecutor.tearDownClass = classmethod(lambda cls: None)
         te.TestExecutor._br_presetup = True
+        global PRESETUP_DONE
+        PRESETUP_DONE = True
     except BaseException as e:  # noqa: BLE001
         print(f"executor presetup failed: {e!r}", file=sys.stderr)
 
 
 def preload(modules):
+    t = os.times()
+    print(f"preload start c{t.user + t.system:.2f} {modules[:3]}", file=sys.stderr, flush=True)
     for m in modules:
         try:
             importlib.import_module(m)
@@ -265,7 +277,7 @@ def loaded_files(root):
 # child side
 
 
-def _child_run(tests, wfd, purge, per_test_timeout, filters=None):
+def _child_run(tests, wfd, purge, per_test_timeout, filters=None, proxies=None, reload_tpc=False):
     """tests: list of (number, module, cls, method, timeout_s)."""
     import unittest
 
@@ -287,11 +299,17 @@ def _child_run(tests, wfd, purge, per_test_timeout, filters=None):
                 del sys.modules[name]
 
     filters = filters or {}
+    proxies = proxies or {}
     try:
         importlib.import_module("tests.helpers")
         wrap_helpers()
     except BaseException:  # noqa: BLE001
         pass
+    if reload_tpc:
+        try:
+            _reload_tpc_rows()
+        except BaseException:  # noqa: BLE001
+            pass
 
     def on_alarm(signum, frame):
         raise TestTimeout()
@@ -378,6 +396,10 @@ def _child_run(tests, wfd, purge, per_test_timeout, filters=None):
             for n in nums.values():
                 out.write(f"E {n} 1\n")
             continue
+        for meth, num in nums.items():
+            proxy = proxies.get(num)
+            if proxy is not None:
+                setattr(cls, meth, proxy)
         suite = unittest.TestSuite()
         for meth in nums:
             try:
@@ -460,11 +482,51 @@ def run_func(func, args, purge=False, timeout=60.0):
         return None
 
 
+def _proxy_max_nodes(self):
+    """Scaled-down tests/test_parser.py::TestParser::test_max_nodes (same parse paths and limit
+    logic, ~100x fewer nodes, limits scaled to match)."""
+    from sqlglot import exp, parse_one
+    from sqlglot.errors import ParseError
+
+    self.assertIsInstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+    cols = [f"col{i}" for i in range(500)]
+    sql = f"SELECT {','.join(cols)} FROM t"
+    self.assertIsInstance(parse_one(sql, max_nodes=1_000_000), exp.Select)
+    width = 100
+    depth = 100
+    expr = "x" + "=x" * depth
+    sql = f"SELECT {','.join([expr] * width)}"
+    with self.assertRaises(ParseError) as ctx:
+        parse_one(sql, max_nodes=10_000)
+    self.assertIn("Maximum number of AST nodes", str(ctx.exception))
+    with self.assertRaises(ParseError) as ctx:
+        parse_one(sql, max_nodes=500)
+    self.assertIn("(500)", str(ctx.exception))
+    with self.assertRaises(ParseError):
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+    self.assertIsInstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+    self.assertIsInstance(parse_one(f"SELECT {','.join([expr] * 20)}", max_nodes=1_000_000),
+                          exp.Select)
+
+
+PROXIES = {"tests/test_parser.py::TestParser::test_max_nodes": _proxy_max_nodes}
+
+
+def _reload_tpc_rows():
+    te = sys.modules.get("tests.test_executor")
+    h = sys.modules.get("tests.helpers")
+    if te is None or h is None:
+        return
+    load = getattr(h.load_sql_fixture_pairs, "__wrapped__", h.load_sql_fixture_pairs)
+    te.TestExecutor.tpch_sqls = list(load("optimizer/tpc-h/tpc-h.sql"))
+    te.TestExecutor.tpcds_sqls = list(load("optimizer/tpc-ds/tpc-ds.sql"))
+
+
 GC_THRESHOLD = tuple(int(x) for x in os.environ.get("BR_GC", "50000,50,100").split(","))
 
 
 def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None, deadline=None,
-              filters=None):
+              filters=None, proxies=None, reload_tpc=False):
     """Fork a child of the current process to run tests. Returns {number: failed_bool}.
 
     tests: list of (number, module, cls, method). Tests whose result never arrives count as
@@ -487,7 +549,7 @@ def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None,
         if pid == 0:
             os.close(r)
             try:
-                _child_run(remaining, w, purge, timeouts, filters)
+                _child_run(remaining, w, purge, timeouts, filters, proxies, reload_tpc)
             finally:
                 os._exit(0)
         os.close(w)
@@ -498,13 +560,19 @@ def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None,
         done = False
         killed = False
         stopped = False
+        last_event = time.monotonic()
         while not done and not stopped:
             now = time.monotonic()
             if current is not None:
-                limit = timeouts.get(current, 60) + 5
+                limit = timeouts.get(current, 60) + KILL_GRACE
                 wait = max(0.05, current_start + limit - now)
             else:
-                wait = 30
+                # between tests (imports, class setup): nothing legitimate takes this long
+                if now - last_event > IDLE_LIMIT:
+                    os.kill(pid, signal.SIGKILL)
+                    killed = True
+                    break
+                wait = max(0.05, last_event + IDLE_LIMIT - now)
             if deadline is not None:
                 if now > deadline:
                     os.kill(pid, signal.SIGKILL)
@@ -514,7 +582,7 @@ def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None,
             ready, _, _ = select.select([r], [], [], wait)
             if not ready:
                 if current is not None and time.monotonic() - current_start > \
-                        timeouts.get(current, 60) + 5:
+                        timeouts.get(current, 60) + KILL_GRACE:
                     os.kill(pid, signal.SIGKILL)
                     killed = True
                     break
@@ -522,6 +590,7 @@ def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None,
             chunk = os.read(r, 65536)
             if not chunk:
                 break
+            last_event = time.monotonic()
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -561,8 +630,8 @@ def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None,
         if current is not None:
             results[current] = True  # hung or crashed while running
         remaining = [t for t in remaining if t[0] not in results]
-        if not done and (killed or current is not None):
-            continue  # rerun what is left in a fresh child
+        if not done and current is not None:
+            continue  # a test hung or crashed: rerun what is left in a fresh child
         # finished (or died outside a test): anything without a result counts as failed
         for t in remaining:
             results[t[0]] = True

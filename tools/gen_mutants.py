@@ -342,8 +342,26 @@ def testfile_mutant():
 
 
 kinds = {}
+def multi_mutant():
+    parts = []
+    files = set()
+    for fn in (comment_mutant, rng.choice([code_mutant, class_const_mutant]), fixture_mutant):
+        r = fn()
+        if r is None or r[0] in files:
+            continue
+        files.add(r[0])
+        parts.append(r)
+    if len(parts) < 2:
+        return None
+    return parts
+
+
 MODE = os.environ.get("MUT_MODE", "1")
-if MODE == "1":
+if MODE == "3":
+    gens = [("code", code_mutant, 9), ("classconst", class_const_mutant, 2),
+            ("comment", comment_mutant, 2), ("fixture", fixture_mutant, 5),
+            ("delete", delete_mutant, 1), ("multi", multi_mutant, 2)]
+elif MODE == "1":
     gens = [("code", code_mutant, 5), ("classconst", class_const_mutant, 2), ("comment", comment_mutant, 1),
             ("fixture", fixture_mutant, 2), ("delete", delete_mutant, 1)]
 else:
@@ -358,12 +376,12 @@ while i < N:
     r = fn()
     if r is None:
         continue
-    rel, old, new = r
-    if old == new:
+    parts = r if isinstance(r, list) else [r]
+    if any(old == new for _, old, new in parts):
         continue
     cid = f"m{SEED}_{i:03d}"
-    open(os.path.join(OUT, cid + ".patch"), "w").write(diff(rel, old, new))
-    kinds[cid] = {"kind": name, "file": rel}
+    open(os.path.join(OUT, cid + ".patch"), "w").write("".join(diff(rel, old, new) for rel, old, new in parts))
+    kinds[cid] = {"kind": name, "file": ",".join(p[0] for p in parts)}
     i += 1
 json.dump(kinds, open(os.path.join(OUT, "kinds.json"), "w"), indent=1)
 print(f"wrote {N} mutants", file=sys.stderr)

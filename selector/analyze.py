@@ -24,6 +24,7 @@ class Impact:
         self.syntax_error = False
         self.notes = []
         self.pairs = []  # (old_stmt, new_stmt, header_only) leaf statement changes in functions
+        self.dict_keys = {}  # (class qualname or "", binding name) -> changed dict-entry keys
         self.exotic = False  # some change is not a leaf statement edit inside a function
 
     def __repr__(self):
@@ -87,14 +88,58 @@ def _targets(stmt):
         for a in stmt.names:
             names.add((a.asname or a.name).split(".")[0])
         return names
-    for node in ast.walk(stmt):
+    # bindings made by this statement in its own scope (not inside lambdas/comprehensions/defs)
+    stack = [stmt]
+    while stack:
+        node = stack.pop()
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
             names.add(node.id)
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
             names.add(node.attr)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
+            continue
+        if node is not stmt and isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp,
+                                                  ast.DictComp, ast.GeneratorExp)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
     return names
+
+
+def _dict_entry_keys(o, n):
+    """If o/n are assignments of dict literals differing only in some entries, return the keys
+    of those entries (old and new) as [("kw", str) | ("cls", name)]; None if not refinable."""
+    ov = getattr(o, "value", None)
+    nv = getattr(n, "value", None)
+    if not isinstance(ov, ast.Dict) or not isinstance(nv, ast.Dict):
+        return None
+    if _dump_targets(o) != _dump_targets(n) or len(ov.keys) != len(nv.keys):
+        return None
+    out = []
+    for ok, ovv, nk, nvv in zip(ov.keys, ov.values, nv.keys, nv.values):
+        if (ok is None) != (nk is None):
+            return None
+        same_k = ok is None or _dump(ok) == _dump(nk)
+        if same_k and _dump(ovv) == _dump(nvv):
+            continue
+        if ok is None:
+            return None  # a **spread entry changed
+        for k in (ok, nk):
+            if isinstance(k, ast.Constant) and isinstance(k.value, str) and k.value:
+                out.append(("kw", k.value))
+            elif isinstance(k, ast.Attribute) and k.attr[:1].isupper():
+                out.append(("cls", k.attr))
+            else:
+                return None
+    return out or None
+
+
+def _dump_targets(stmt):
+    if isinstance(stmt, ast.Assign):
+        return [_dump(t) for t in stmt.targets]
+    if isinstance(stmt, ast.AnnAssign):
+        return [_dump(stmt.target)]
+    return None
 
 
 def _is_noop(stmt):
@@ -301,7 +346,11 @@ class Differ:
             self.im.spans.extend(spans)
             self.im.exotic = True
             return
-        self.class_change(q, _targets(o) | _targets(n))
+        keys = _dict_entry_keys(o, n)
+        tg = _targets(o) | _targets(n)
+        if keys is not None and len(tg) == 1:
+            self.im.dict_keys[(q, next(iter(tg)))] = keys
+        self.class_change(q, tg)
 
     # ---- module scope -----------------------------------------------------
     def module(self, old, new):
@@ -399,6 +448,10 @@ class Differ:
             self.im.spans.extend(spans)
             self.im.exotic = True
             return
+        keys = _dict_entry_keys(o, n)
+        tg = _targets(o) | _targets(n)
+        if keys is not None and len(tg) == 1:
+            self.im.dict_keys[("", next(iter(tg)))] = keys
         self.module_stmt_change(o, n)
 
 

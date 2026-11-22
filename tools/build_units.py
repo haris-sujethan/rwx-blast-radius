@@ -53,8 +53,12 @@ def child(test, outpath):
                     execlines.setdefault(fn, set()).add(line)
         return mon.DISABLE
 
+    def on_start(code, offset):
+        return on_line(code, code.co_firstlineno)
+
     mon.register_callback(tool, mon.events.LINE, on_line)
-    mon.set_events(tool, mon.events.LINE)
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
     times = {}
 

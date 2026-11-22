@@ -39,15 +39,14 @@ def changed_cases(old, new, n_units):
     None if the case structure changed (or the scheme is unknown)."""
     if old is None or new is None:
         return None
-    for fn in (pair_cases, line_cases):
-        a = fn(old)
-        if len(a) != n_units:
-            continue
-        b = fn(new)
-        if len(a) != len(b):
-            return None
-        return {i for i, (x, y) in enumerate(zip(a, b)) if x != y}
-    return None
+    matches = [fn for fn in (pair_cases, line_cases) if len(fn(old)) == n_units]
+    if len(matches) != 1:
+        return None  # unknown or ambiguous case scheme
+    fn = matches[0]
+    a, b = fn(old), fn(new)
+    if len(a) != len(b):
+        return None
+    return {i for i, (x, y) in enumerate(zip(a, b)) if x != y}
 
 
 class UnitDB:
@@ -83,12 +82,11 @@ class UnitDB:
                 return FULL, 1.0
         if not u["nc"].isdisjoint(req["classes"]):
             return FULL, 1.0
-        for cls, clines in req.get("conj", ()):
+        for cls, _clines in req.get("conj", ()):
+            # a class constant can be consumed when the class is built (derived tables), so at
+            # case level every case that uses the class counts, whatever lines it runs
             if cls in u["nc"]:
-                for rel, lines in clines.items():
-                    nl = u["nl"].get(rel)
-                    if nl and not nl.isdisjoint(lines):
-                        return FULL, 1.0
+                return FULL, 1.0
         S = self.sets
         bits = 0
         explained = False
@@ -104,23 +102,11 @@ class UnitDB:
             i = u["classes"].get(c)
             if i is not None:
                 bits |= S[i]
-        for cls, clines in req.get("conj", ()):
+        for cls, _clines in req.get("conj", ()):
             ci = u["classes"].get(cls)
-            in_nonunit = cls in u["nc"]
-            if ci is None and not in_nonunit:
-                continue
-            lb = 0
-            for rel, lines in clines.items():
-                d = u["lines"].get(rel)
-                if not d:
-                    continue
-                for ln in lines:
-                    i = d.get(ln)
-                    if i is not None:
-                        lb |= S[i]
-            # an instance made outside the units may be used inside any of them
-            bits |= lb if in_nonunit or ci is None else lb & S[ci]
-            explained = True
+            if ci is not None:
+                bits |= S[ci]
+                explained = True
         if bits:
             explained = True
         units = u["units"]
@@ -136,10 +122,15 @@ class UnitDB:
             changed = changed_cases(texts[0], texts[1], total)
             if changed is None:
                 return FULL, 1.0
-            explained = True  # rows the test loads but never works on cannot affect it
-            for pos in idxs:
-                if units[pos][1] in changed:
-                    bits |= 1 << pos
+            have = {units[pos][1]: pos for pos in idxs}
+            for i in changed:
+                if i not in have:
+                    if rel.startswith(("tests/fixtures/optimizer/tpc-h/",
+                                       "tests/fixtures/optimizer/tpc-ds/")) and not idxs:
+                        continue  # rows loaded up front and never worked on by this test
+                    return FULL, 1.0  # a changed case we never saw run: cannot reason about it
+                bits |= 1 << have[i]
+            explained = True
         if not explained:
             return FULL, 1.0
         if not bits:

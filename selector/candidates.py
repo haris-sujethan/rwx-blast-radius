@@ -274,6 +274,63 @@ class MapDB:
             v |= self.name_refs({simple} | set(attrs), depth + 1, seen)
         return v
 
+    # ---- dict-entry refinement -------------------------------------------
+    KW_DICT_RE = re.compile(r".*(PARSERS|FUNCTIONS|KEYWORDS|_TOKENS)$|^ENV$")
+
+    def dict_entry_mask(self, im):
+        """A change confined to one entry of a dict literal (class constant or module constant)
+        only matters where that entry is looked up: tests building nodes of an expression-class
+        key, or tests whose SQL text contains a keyword key. None if not applicable."""
+        if not im.dict_keys or len(im.dict_keys) != 1 or im.spans or im.importers or \
+                im.syntax_error:
+            return None
+        (q, name), keys = next(iter(im.dict_keys.items()))
+        if q:
+            if set(im.classes) != {q} or im.names:
+                return None
+        elif im.classes or set(im.names) != {name}:
+            return None
+        mask = 0
+        for kind, val in keys:
+            if kind == "cls":
+                found = False
+                for key, idx in self.classes.items():
+                    mod, _, qual = key.partition(":")
+                    if mod.startswith("sqlglot.expressions") and qual.rsplit(".", 1)[-1] == val:
+                        mask |= self.sets[idx]
+                        found = True
+                if not found:
+                    pass  # never instantiated by any test: nothing can observe the entry
+            elif kind == "kw":
+                if not self.KW_DICT_RE.match(name):
+                    return None
+                mask |= self.keyword_tests(val)
+        return mask
+
+    def keyword_tests(self, word):
+        """Tests whose test file or opened fixture files mention `word` (case-insensitive)."""
+        cache = getattr(self, "_kw_cache", None)
+        if cache is None:
+            cache = self._kw_cache = {}
+        if word in cache:
+            return cache[word]
+        w = re.escape(word.encode()).replace(rb"\ ", rb"\s+")
+        if re.fullmatch(rb"\w[\w\\s+]*\w|\w", w.replace(rb"\s+", b" ")):
+            rx = re.compile(rb"(?<![A-Za-z0-9_])" + w + rb"(?![A-Za-z0-9_])", re.I)
+        else:
+            rx = re.compile(w, re.I)
+        v = 0
+        for tf, nums in self.file_tests.items():
+            if rx.search(self.source(tf)):
+                for n in nums:
+                    v |= 1 << n
+        for path, idx in self.opens.items():
+            if path.startswith("tests/fixtures/") and os.path.isfile(os.path.join(self.repo, path)):
+                if rx.search(self.source(path)):
+                    v |= self.sets[idx]
+        cache[word] = v
+        return v
+
     def class_span(self, rel, qual):
         tree = self.tree(rel)
         body = tree.body
@@ -303,6 +360,7 @@ class Selection:
         self.sites = 0
         self.req = {"lines": {}, "classes": set(), "full": 0, "fixtures": set(), "conj": []}
         self.fixture_texts = {}  # rel -> (old, new)
+        self.primary_classes = set()  # classes the patch itself changes ("module:qualname")
 
 
 def select(db: MapDB, patch_text: str) -> Selection:
@@ -369,16 +427,24 @@ def _select(db, sel, patch_text):
                     sel.sites += nsites
                 if not complete or src is None:
                     sel.monitorable = False
+            vc = 0
             if im.importers:
-                v |= db.importers(fp.old_path or rel)
+                vc |= db.importers(fp.old_path or rel)
                 if fp.old_path is None:
-                    v |= db.name_refs({modname_of(rel).rsplit(".", 1)[-1]})
+                    vc |= db.name_refs({modname_of(rel).rsplit(".", 1)[-1]})
             if im.spans:
-                v |= db.span_tests(rel, im.spans)
+                vc |= db.span_tests(rel, im.spans)
             for q in im.classes:
-                v |= db.class_change(rel, im.modname, q, im.class_names.get(q, set()), 0, set())
+                sel.primary_classes.add(f"{im.modname}:{q}")
+                vc |= db.class_change(rel, im.modname, q, im.class_names.get(q, set()), 0, set())
             if im.names:
-                v |= db.name_refs(im.names)
+                vc |= db.name_refs(im.names)
+            mask = db.dict_entry_mask(im)
+            if mask is not None:
+                sel.notes.append(f"dict-entry refinement: {bin(vc).count('1')} -> "
+                                 f"{bin(vc & mask).count('1')}")
+                vc &= mask
+            v |= vc
                 # names defined at module level are also visible as module attributes of
                 # importers' module-level code; tests importing it that reference via attr
         elif rel.endswith(".py"):

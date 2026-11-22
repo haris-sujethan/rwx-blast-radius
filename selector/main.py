@@ -17,6 +17,8 @@ MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.bin"))
 COSTS = os.environ.get("BR_COSTS", os.path.join(HERE, "costs.json"))
 UNITS = os.environ.get("BR_UNITS", os.path.join(HERE, "units.bin"))
 TPCFP = os.environ.get("BR_TPCFP", "/app/tpcfp.json")
+PROXY_IDS = set() if os.environ.get("BR_NO_PROXY") == "1" else {
+    "tests/test_parser.py::TestParser::test_max_nodes"}
 EXEC_TPC = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql",
             "tests/test_executor.py::TestExecutor::test_execute_tpch": "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
 STAGES = os.environ.get("BR_STAGES", "/app/stages.json")
@@ -25,15 +27,19 @@ WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "2.4"))
 CHEAP_MAX = float(os.environ.get("BR_CHEAP_MAX", "1.5"))
 RUN_CAP = float(os.environ.get("BR_RUN_CAP", "20"))
+CLEAN_SKIP_MIN = float(os.environ.get("BR_CLEAN_SKIP_MIN", "20"))
+CLEAN_MIN_EXEC = int(os.environ.get("BR_CLEAN_MIN_EXEC", "50"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 
 T0 = time.monotonic()
+ID2MAP = {}
 STATE = {"commits": [], "printed": set(), "cands": {}, "dur_ms": None, "ntests": 0}
 
 
 def log(*a):
-    print(f"[{time.monotonic() - T0:6.2f}]", *a, file=sys.stderr, flush=True)
+    t = os.times()
+    print(f"[{time.monotonic() - T0:6.2f} c{t.user + t.system:5.2f}]", *a, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -129,6 +135,7 @@ def main():
     id2num = {t["id"]: t["number"] for t in tests}
     mapnum2num = [id2num.get(i) for i in db.ids]
     id2mapnum = {i: k for k, i in enumerate(db.ids)}
+    ID2MAP.update(id2mapnum)
     try:
         costs = json.load(open(COSTS))
     except OSError:
@@ -174,6 +181,9 @@ def main():
                 elif plan != FULL:
                     filters[n] = plan
                     estc[n] = est_cpu[n] * frac + 0.01 * CPU_SCALE
+        for n in cands:
+            if tid[n] in PROXY_IDS:
+                estc[n] = 0.15 * CPU_SCALE
         sel.filters = filters
         sel.estc = estc
 
@@ -273,7 +283,8 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             if rel is None:
                 continue
             ut = udb.tests.get(tid[n]) if udb is not None else None
-            if not tpcfp.safe_for(sel.files, sel.req, ut.get("execlines") if ut else None):
+            if not tpcfp.safe_for(sel.files, sel.req, ut.get("execlines") if ut else None,
+                                   sel.primary_classes, 1 << ID2MAP.get(tid[n], 0)):
                 continue
             orig = {int(k): v for k, v in tpc_orig.get(rel, {}).items()}
             flt = sel.filters.get(n)
@@ -306,7 +317,11 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             return sel.estc.get(n, est_cpu[n])
 
         loaded = runner.loaded_files(MIRROR + os.sep)
-        purge = any(f in loaded for f in sel.files)
+        tpc_sql = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
+        reload_tpc = runner.PRESETUP_DONE and any(f in tpc_sql for f in sel.files)
+        purge = any(f in loaded for f in sel.files) or any(
+            f.startswith(runner.PRESETUP_PREFIXES) and f not in tpc_sql for f in sel.files
+            if runner.PRESETUP_DONE)
         now = time.monotonic()
         if now - T0 > WALL_BUDGET - 3:
             log(f"{cid}: out of time, blind")
@@ -322,6 +337,7 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
         deadline = min(T0 + WALL_BUDGET, now + max(15.0, 3 * est_cheap + 10))
         files = dict(sel.files)
         files.update(sel.instr)
+        proxies = {n: runner.PROXIES[tid[n]] for n in cheap | expensive if tid[n] in PROXY_IDS}
         mirror.apply(files)
         c0 = os.times()
         try:
@@ -336,7 +352,8 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 for n in expensive:
                     if tid[n] in EXEC_TPC:
                         ut = udb_.tests.get(tid[n]) if udb_ is not None else None
-                        if tpcfp.safe_for(sel.files, sel.req, ut.get("execlines") if ut else None):
+                        if tpcfp.safe_for(sel.files, sel.req, ut.get("execlines") if ut else None,
+                                   sel.primary_classes, 1 << ID2MAP.get(tid[n], 0)):
                             tpc_maybe.add(n)
 
             def plan_expensive(fail, exclude=()):
@@ -371,21 +388,40 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
 
             unrun = set()
             if skip_cheap:
-                unrun = set(cheap)
+                # too many to run: still verify the few that are cheap to run but costly to include
+                verify = {n for n in cheap if dur_ms[n] >= 1000 and E(n) < 0.5 * dur_ms[n] / 1000}
+                unrun = set(cheap) - verify
+                if verify:
+                    res = runner.run_tests(spec_of(verify, sel, E), purge=purge,
+                                           timeouts={n: max(1.5, E(n) * 2 + 1) for n in verify},
+                                           deadline=deadline, filters=sel.filters, proxies=proxies,
+                                           reload_tpc=reload_tpc)
+                    failing |= {n for n, f in res.items() if f} | {n for n in verify if n not in res}
             elif cheap:
                 res = runner.run_tests(spec_of(cheap, sel, E), purge=purge, stop_cb=stop_cb,
-                                       timeouts={n: max(4.0, E(n) * 5 + 3) for n in cheap},
-                                       deadline=deadline, filters=sel.filters)
+                                       timeouts={n: max(1.5, E(n) * 2 + 1) for n in cheap},
+                                       deadline=deadline, filters=sel.filters, proxies=proxies,
+                                       reload_tpc=reload_tpc)
                 failing |= {n for n, f in res.items() if f}
                 unrun = cheap - set(res)
                 for n in cheap:
                     ex, inf = runner.WM_LOG.get(n, (0, 0))
                     wm_ex += ex
                     wm_inf += inf
-            clean = (sel.monitorable and sel.sites > 0 and wm_ex > 0 and wm_inf == 0
+            clean = (sel.monitorable and sel.sites > 0 and wm_ex >= CLEAN_MIN_EXEC and wm_inf == 0
                      and not failing and not unrun)
             blind = set(unrun)
             run_b = set()
+            if clean:
+                # clean evidence only ever skips the very expensive tests; the rest still run
+                keep = {n for n in expensive if E(n) < CLEAN_SKIP_MIN}
+                if keep:
+                    res = runner.run_tests(spec_of(keep, sel, E), purge=purge,
+                                           timeouts={n: max(1.5, E(n) * 2 + 1) for n in keep},
+                                           deadline=deadline, filters=sel.filters, proxies=proxies,
+                                       reload_tpc=reload_tpc)
+                    failing |= {n for n, f in res.items() if f} | {n for n in keep if n not in res}
+                    run_b |= keep
             if expensive and not clean:
                 tpc_check(cid, sel, expensive, failing | unrun, purge, E)
             if expensive and not clean:
@@ -393,8 +429,9 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 blind |= b
                 if run_b:
                     res = runner.run_tests(spec_of(run_b, sel, E), purge=purge,
-                                           timeouts={n: max(4.0, E(n) * 5 + 3) for n in run_b},
-                                           deadline=deadline, filters=sel.filters)
+                                           timeouts={n: max(1.5, E(n) * 2 + 1) for n in run_b},
+                                           deadline=deadline, filters=sel.filters, proxies=proxies,
+                                       reload_tpc=reload_tpc)
                     failing |= {n for n, f in res.items() if f} | {n for n in run_b if n not in res}
         finally:
             mirror.restore()
