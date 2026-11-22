@@ -12,10 +12,12 @@ tarfile.open(fileobj=io.BytesIO(d)).extractall('/app', filter='data'); \
 os.rename('/app/sqlglot-${SQLGLOT_SHA}', '/app/repo')"
 
 COPY selector /app/selector
+COPY diag_sample /app/sample
 COPY tools/make_stages.py /app/tools/make_stages.py
 RUN python -m compileall -q -j 0 /app/repo/sqlglot /app/repo/tests /app/selector \
  && cd / && python /app/tools/make_stages.py /app/repo /app/stages.json \
+ && python /app/selector/tpcfp.py /app/repo /app/tpcfp.json \
  && chmod -R a+rX /app
 
 ENV BR_REPO=/app/repo BR_STAGES=/app/stages.json
-CMD ["python", "/app/selector/main.py"]
+CMD ["python", "/app/selector/diag.py"]

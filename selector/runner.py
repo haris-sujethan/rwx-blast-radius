@@ -17,11 +17,17 @@ import time
 
 DEVNULL = os.open(os.devnull, os.O_RDWR)
 CPU_LOG = {}
+CUR_FILTER = None
+FAIL_FAST = os.environ.get("BR_FAIL_FAST", "1") == "1"
 WM_LOG = {}
 
 
 class TestTimeout(BaseException):
     pass
+
+
+class TestAbort(BaseException):
+    """Raised once a test is known to fail: the rest of it is wasted CPU."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -153,7 +159,7 @@ class SyncExecutor:
             fn, a, k = pickle.loads(pickle.dumps((fn, a, k)))
             f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
         except BaseException as e:  # noqa: BLE001
-            if isinstance(e, TestTimeout):
+            if isinstance(e, (TestTimeout, TestAbort)):
                 raise
             f.set_exception(e)
         return f
@@ -183,12 +189,39 @@ def prepare_base(mirror_dir):
     cfp.ProcessPoolExecutor = SyncExecutor
 
 
+def wrap_helpers():
+    """Let fixture loops yield only the cases selected for the running test."""
+    h = sys.modules.get("tests.helpers")
+    if h is None or getattr(h, "_br_wrapped", False):
+        return
+
+    def mk(orig):
+        def gen(filename, *a, **k):
+            flt = CUR_FILTER
+            allowed = None
+            if flt is not None:
+                allowed = flt.get(os.path.join("tests", "fixtures", filename), ())
+            for idx, item in enumerate(orig(filename, *a, **k)):
+                if allowed is None or idx in allowed:
+                    yield item
+
+        gen.__name__ = orig.__name__
+        gen.__wrapped__ = orig
+        return gen
+
+    h.load_sql_fixture_pairs = mk(h.load_sql_fixture_pairs)
+    h.load_sql_fixtures = mk(h.load_sql_fixtures)
+    h._br_wrapped = True
+
+
 def preload(modules):
     for m in modules:
         try:
             importlib.import_module(m)
         except BaseException as e:  # noqa: BLE001
             print(f"preload {m} failed: {e!r}", file=sys.stderr)
+        if m == "tests.helpers":
+            wrap_helpers()
 
 
 def loaded_files(root):
@@ -204,7 +237,7 @@ def loaded_files(root):
 # child side
 
 
-def _child_run(tests, wfd, purge, per_test_timeout):
+def _child_run(tests, wfd, purge, per_test_timeout, filters=None):
     """tests: list of (number, module, cls, method, timeout_s)."""
     import unittest
 
@@ -225,6 +258,13 @@ def _child_run(tests, wfd, purge, per_test_timeout):
                     name.startswith("tests."):
                 del sys.modules[name]
 
+    filters = filters or {}
+    try:
+        importlib.import_module("tests.helpers")
+        wrap_helpers()
+    except BaseException:  # noqa: BLE001
+        pass
+
     def on_alarm(signum, frame):
         raise TestTimeout()
 
@@ -242,11 +282,29 @@ def _child_run(tests, wfd, purge, per_test_timeout):
             self.t0 = time.process_time()
             self.w0 = tuple(wm_stats)
             n = self.nums.get(test._testMethodName)
+            global CUR_FILTER
+            CUR_FILTER = filters.get(n)
+            self.saved = []
+            if CUR_FILTER:
+                # fixture rows loaded up front in setUpClass (executor TPC-H / TPC-DS)
+                cls = type(test)
+                for attr, rel in (("tpch_sqls", "tests/fixtures/optimizer/tpc-h/tpc-h.sql"),
+                                  ("tpcds_sqls", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")):
+                    rows = getattr(cls, attr, None)
+                    if isinstance(rows, list):
+                        keep = CUR_FILTER.get(rel, ())
+                        self.saved.append((cls, attr, rows))
+                        setattr(cls, attr, [r for i, r in enumerate(rows) if i in keep])
             if n is not None:
                 out.write(f"B {n}\n")
                 signal.setitimer(signal.ITIMER_REAL, per_test_timeout.get(n, 60))
 
         def stopTest(self, test):
+            global CUR_FILTER
+            CUR_FILTER = None
+            for cls, attr, rows in getattr(self, "saved", ()):
+                setattr(cls, attr, rows)
+            self.saved = []
             signal.setitimer(signal.ITIMER_REAL, 0)
             n = self.nums.get(test._testMethodName)
             if n is not None:
@@ -268,6 +326,8 @@ def _child_run(tests, wfd, purge, per_test_timeout):
         def addSubTest(self, test, subtest, err):
             if err is not None:
                 self.cur_failed = True
+                if FAIL_FAST and not issubclass(err[0], (TestAbort, TestTimeout)):
+                    raise TestAbort()
 
         def addUnexpectedSuccess(self, test):
             self.cur_failed = True
@@ -306,10 +366,77 @@ def _child_run(tests, wfd, purge, per_test_timeout):
     out.flush()
 
 
+def run_func(func, args, purge=False, timeout=60.0):
+    """Run func(*args) in a forked child (sees the patched mirror). Returns its JSON-able result,
+    or None if it failed, crashed or timed out."""
+    import gc
+    import json
+
+    gc.collect()
+    gc.freeze()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            gc.set_threshold(*GC_THRESHOLD)
+            os.dup2(DEVNULL, 1)
+            os.dup2(DEVNULL, 2)
+            if purge:
+                for name in list(sys.modules):
+                    if name == "sqlglot" or name.startswith("sqlglot.") or name == "tests" or \
+                            name.startswith("tests."):
+                        del sys.modules[name]
+            try:
+                importlib.import_module("tests.helpers")
+                wrap_helpers()
+            except BaseException:  # noqa: BLE001
+                pass
+            res = func(*args)
+            data = json.dumps(res).encode()
+            with os.fdopen(w, "wb") as f:
+                f.write(data)
+        except BaseException:  # noqa: BLE001
+            pass
+        finally:
+            os._exit(0)
+    os.close(w)
+    chunks = []
+    end = time.monotonic() + timeout
+    ok = True
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            os.kill(pid, signal.SIGKILL)
+            ok = False
+            break
+        ready, _, _ = select.select([r], [], [], left)
+        if not ready:
+            continue
+        c = os.read(r, 1 << 16)
+        if not c:
+            break
+        chunks.append(c)
+    os.close(r)
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    if not ok or not chunks:
+        return None
+    try:
+        return json.loads(b"".join(chunks))
+    except ValueError:
+        return None
+
+
 GC_THRESHOLD = tuple(int(x) for x in os.environ.get("BR_GC", "50000,50,100").split(","))
 
 
-def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None, deadline=None):
+def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None, deadline=None,
+              filters=None):
     """Fork a child of the current process to run tests. Returns {number: failed_bool}.
 
     tests: list of (number, module, cls, method). Tests whose result never arrives count as
@@ -332,7 +459,7 @@ def run_tests(tests, purge=False, timeouts=None, hard_budget=None, stop_cb=None,
         if pid == 0:
             os.close(r)
             try:
-                _child_run(remaining, w, purge, timeouts)
+                _child_run(remaining, w, purge, timeouts, filters)
             finally:
                 os._exit(0)
         os.close(w)

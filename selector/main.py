@@ -15,6 +15,10 @@ DATA = os.environ.get("BR_DATA", "/data")
 REPO = os.environ.get("BR_REPO", "/app/repo")
 MAP = os.environ.get("BR_MAP", os.path.join(HERE, "map.bin"))
 COSTS = os.environ.get("BR_COSTS", os.path.join(HERE, "costs.json"))
+UNITS = os.environ.get("BR_UNITS", os.path.join(HERE, "units.bin"))
+TPCFP = os.environ.get("BR_TPCFP", "/app/tpcfp.json")
+EXEC_TPC = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql",
+            "tests/test_executor.py::TestExecutor::test_execute_tpch": "tests/fixtures/optimizer/tpc-h/tpc-h.sql"}
 STAGES = os.environ.get("BR_STAGES", "/app/stages.json")
 MIRROR = os.environ.get("BR_MIRROR", "/tmp/m")
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))
@@ -111,9 +115,18 @@ def main():
     from candidates import MapDB, bits, select
 
     db = MapDB(MAP, REPO)
+    try:
+        from units import FULL, SKIP, UnitDB
+
+        udb = UnitDB(UNITS)
+    except Exception as e:  # noqa: BLE001
+        log(f"no unit map: {e!r}")
+        udb = None
+    STATE["udb"] = udb
     # map test ids -> numbers in this tests.json (ids are stable, numbers might not be)
     id2num = {t["id"]: t["number"] for t in tests}
     mapnum2num = [id2num.get(i) for i in db.ids]
+    id2mapnum = {i: k for k, i in enumerate(db.ids)}
     try:
         costs = json.load(open(COSTS))
     except OSError:
@@ -143,11 +156,33 @@ def main():
             emit(cid, list(range(ntests)))
             continue
         STATE["cands"][cid] = cands
-        cheap = {n for n in cands if est_cpu[n] <= CHEAP_MAX}
+        filters, estc = {}, {}
+        if udb is not None:
+            for n in list(cands):
+                mn = id2mapnum.get(tid[n])
+                if mn is None:
+                    continue
+                try:
+                    plan, frac = udb.plan(tid[n], 1 << mn, sel.req, sel.fixture_texts)
+                except Exception as e:  # noqa: BLE001
+                    log(f"{cid}: unit plan failed for {n}: {e!r}")
+                    continue
+                if plan == SKIP:
+                    cands.discard(n)
+                elif plan != FULL:
+                    filters[n] = plan
+                    estc[n] = est_cpu[n] * frac + 0.01 * CPU_SCALE
+        sel.filters = filters
+        sel.estc = estc
+
+        def E(n):
+            return estc.get(n, est_cpu[n])
+
+        cheap = {n for n in cands if E(n) <= CHEAP_MAX}
         expensive = cands - cheap
         log(f"{cid}: cands={len(cands)} cheap={len(cheap)} exp={sorted(expensive)} "
-            f"est_cpu={sum(est_cpu[n] for n in cheap):.2f} mon={sel.monitorable} "
-            f"sites={sel.sites}")
+            f"est_cpu={sum(E(n) for n in cheap):.2f} mon={sel.monitorable} "
+            f"sites={sel.sites} filtered={len(filters)}")
         if not cands:
             emit(cid, [])
             continue
@@ -194,7 +229,51 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
 
     pending = sorted(((level(sel.files), cid, sel, cheap, exp) for cid, sel, cheap, exp in jobs),
                      key=lambda j: j[0])
+    try:
+        tpc_orig = json.load(open(TPCFP))
+    except OSError:
+        tpc_orig = None
+
+    def tpc_check(cid, sel, expensive, fail, purge, E):
+        """Executor TPC tests: only queries whose plan input / duckdb SQL changed can differ."""
+        import tpcfp
+
+        udb = STATE.get("udb")
+        if tpc_orig is None or not tpcfp.safe_for(sel.files):
+            return
+        for n in list(expensive):
+            rel = EXEC_TPC.get(tid[n])
+            if rel is None:
+                continue
+            orig = {int(k): v for k, v in tpc_orig.get(rel, {}).items()}
+            flt = sel.filters.get(n)
+            idxs = set(flt.get(rel, ())) if flt else set(orig)
+            idxs &= set(orig)
+            base = pack_cost(fail, dur_ms)
+            marginal = (pack_cost(fail | {n}, dur_ms) - base) / 1000
+            est_fp = 0.07 * CPU_SCALE * len(idxs) + 0.3
+            if est_fp >= marginal:
+                continue
+            res = runner.run_func(tpcfp.fingerprints, (rel, sorted(idxs)), purge=purge,
+                                  timeout=max(10.0, 4 * est_fp))
+            if res is None:
+                log(f"{cid}: tpc fingerprint failed for {n}")
+                continue
+            res = {int(k): v for k, v in res.items()}
+            changed = {i for i in idxs if res.get(i) != orig.get(i)}
+            log(f"{cid}: tpc {tid[n].split('::')[-1]}: {len(changed)}/{len(idxs)} changed")
+            if not changed:
+                expensive.discard(n)
+                continue
+            sel.filters[n] = {rel: changed}
+            frac = udb.frac_for(tid[n], rel, changed) if udb is not None else None
+            if frac is not None:
+                sel.estc[n] = est_cpu[n] * frac + 0.01 * CPU_SCALE
+
     def serve(cid, sel, cheap, expensive, lvl):
+        def E(n):
+            return sel.estc.get(n, est_cpu[n])
+
         loaded = runner.loaded_files(MIRROR + os.sep)
         purge = any(f in loaded for f in sel.files)
         now = time.monotonic()
@@ -202,7 +281,7 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             log(f"{cid}: out of time, blind")
             emit(cid, cheap | expensive)
             return
-        est_cheap = sum(est_cpu[n] for n in cheap)
+        est_cheap = sum(E(n) for n in cheap)
         blind_all = pack_cost(cheap | expensive, dur_ms) / 1000
         if est_cheap > min(blind_all + 1.0, RUN_CAP):
             log(f"{cid}: running cheap tests ({est_cheap:.1f}s) costs more than including "
@@ -218,13 +297,21 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             failing = set()
             wm_ex = wm_inf = 0
 
-            def plan_expensive(fail):
+            import tpcfp
+
+            tpc_maybe = set()
+            if tpc_orig is not None and tpcfp.safe_for(sel.files):
+                tpc_maybe = {n for n in expensive if tid[n] in EXEC_TPC}
+
+            def plan_expensive(fail, exclude=()):
                 blind_, run_ = set(), set()
                 cur = set(fail)
                 for n in sorted(expensive, key=lambda n: -dur_ms[n]):
+                    if n in exclude:
+                        continue
                     base = pack_cost(cur, dur_ms)
                     marginal = (pack_cost(cur | {n}, dur_ms) - base) / 1000
-                    if est_cpu[n] < marginal:
+                    if E(n) < marginal:
                         run_.add(n)
                     else:
                         blind_.add(n)
@@ -241,16 +328,16 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 rest = cheap - seen
                 if not rest:
                     return False
-                b, _ = plan_expensive(seen_fail)
+                b, _ = plan_expensive(seen_fail, exclude=tpc_maybe)
                 base = seen_fail | b
                 marginal = (pack_cost(base | rest, dur_ms) - pack_cost(base, dur_ms)) / 1000
-                return marginal <= 0.8 * sum(est_cpu[m] for m in rest)
+                return marginal <= 0.8 * sum(E(m) for m in rest)
 
             unrun = set()
             if cheap:
                 res = runner.run_tests(spec_of(cheap), purge=purge, stop_cb=stop_cb,
-                                       timeouts={n: max(3.0, est_cpu[n] * 4 + 2) for n in cheap},
-                                       deadline=deadline)
+                                       timeouts={n: max(3.0, E(n) * 4 + 2) for n in cheap},
+                                       deadline=deadline, filters=sel.filters)
                 failing |= {n for n, f in res.items() if f}
                 unrun = cheap - set(res)
                 for n in cheap:
@@ -262,12 +349,14 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             blind = set(unrun)
             run_b = set()
             if expensive and not clean:
+                tpc_check(cid, sel, expensive, failing | unrun, purge, E)
+            if expensive and not clean:
                 b, run_b = plan_expensive(failing | unrun)
                 blind |= b
                 if run_b:
                     res = runner.run_tests(spec_of(run_b), purge=purge,
-                                           timeouts={n: max(3.0, est_cpu[n] * 4 + 2) for n in run_b},
-                                           deadline=deadline)
+                                           timeouts={n: max(3.0, E(n) * 4 + 2) for n in run_b},
+                                           deadline=deadline, filters=sel.filters)
                     failing |= {n for n, f in res.items() if f} | {n for n in run_b if n not in res}
         finally:
             mirror.restore()

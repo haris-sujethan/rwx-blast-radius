@@ -39,6 +39,7 @@ class MapDB:
         self._src = {}
         self._ast = {}
         self._pyfiles = None
+        self.req = None
         self.file_tests = {}
         for n, tid in enumerate(self.ids):
             self.file_tests.setdefault(tid.split("::")[0], []).append(n)
@@ -78,16 +79,23 @@ class MapDB:
         return self._pyfiles
 
     # ---- primitive queries ---------------------------------------------
+    def _req_lines(self, rel, lines):
+        if self.req is not None and lines:
+            self.req["lines"].setdefault(rel, set()).update(lines)
+
     def line_tests(self, rel, lines):
         d = self.fn.get(rel)
         if not d:
             return 0
         v = 0
         S = self.sets
+        hit = []
         for ln in lines:
             i = d.get(ln)
             if i is not None:
                 v |= S[i]
+                hit.append(ln)
+        self._req_lines(rel, hit)
         return v
 
     def span_tests(self, rel, spans):
@@ -96,21 +104,30 @@ class MapDB:
             return 0
         v = 0
         S = self.sets
+        hit = []
         for a, b in spans:
             if b - a > 400:
                 for ln, i in d.items():
                     if a <= ln <= b:
                         v |= S[i]
+                        hit.append(ln)
             else:
                 for ln in range(a, b + 1):
                     i = d.get(ln)
                     if i is not None:
                         v |= S[i]
+                        hit.append(ln)
+        self._req_lines(rel, hit)
+        return v
+
+    def _req_full(self, v):
+        if self.req is not None:
+            self.req["full"] |= v
         return v
 
     def importers(self, rel):
         i = self.mods.get(rel)
-        return self.sets[i] if i is not None else 0
+        return self._req_full(self.sets[i] if i is not None else 0)
 
     def openers(self, rel):
         if rel in IGNORED_OPENS or (rel.startswith("tests/") and rel.endswith(".py")):
@@ -119,6 +136,11 @@ class MapDB:
         i = self.opens.get(rel)
         if i is not None:
             v |= self.sets[i]
+        if self.req is not None and v:
+            if rel.startswith("tests/fixtures/"):
+                self.req["fixtures"].add(rel)  # resolved per fixture case later
+            else:
+                self.req["full"] |= v
         return v
 
     def dir_listers(self, rel):
@@ -130,7 +152,7 @@ class MapDB:
                 if i is not None:
                     v |= self.sets[i]
             d = os.path.dirname(d)
-        return v
+        return self._req_full(v)
 
     def class_users(self, modname, qual):
         i = self.classes.get(f"{modname}:{qual}")
@@ -161,6 +183,7 @@ class MapDB:
                     i = fnd.get(lineno)
                     if i is not None:
                         v |= self.sets[i]
+                        self._req_lines(rel, (lineno,))
                     if lineno in dl:
                         deflevel.append(lineno)
             if deflevel and depth < 3:
@@ -227,8 +250,24 @@ class MapDB:
             v |= self.span_tests(rel, [span])
         if users is not None and attrs and all(CONST_RE.fullmatch(a) for a in attrs):
             # a changed class constant only matters to code that reads it by name
-            v &= self.name_refs(set(attrs), depth + 1, set(seen))
+            outer = self.req
+            if outer is not None:
+                self.req = {"lines": {}, "classes": set(), "full": 0, "fixtures": set(),
+                            "conj": []}
+            try:
+                refs = self.name_refs(set(attrs), depth + 1, set(seen))
+            finally:
+                inner, self.req = self.req, outer
+            if outer is not None:
+                outer["full"] |= inner["full"] & v
+                outer["conj"].append((f"{modname}:{qual}", inner["lines"]))
+                outer["conj"].extend(inner["conj"])
+                outer["classes"] |= inner["classes"]
+                outer["fixtures"] |= inner["fixtures"]
+            v &= refs
             return v
+        if users is not None and self.req is not None:
+            self.req["classes"].add(f"{modname}:{qual}")
         if users is None and depth < 3:
             # not an instantiated class we track: follow references to it / its attributes
             simple = qual.rsplit(".", 1)[-1]
@@ -262,10 +301,20 @@ class Selection:
         self.instr = {}  # rel -> weak-mutation instrumented new text
         self.monitorable = True  # every change is a monitored leaf expression edit
         self.sites = 0
+        self.req = {"lines": {}, "classes": set(), "full": 0, "fixtures": set(), "conj": []}
+        self.fixture_texts = {}  # rel -> (old, new)
 
 
 def select(db: MapDB, patch_text: str) -> Selection:
     sel = Selection()
+    db.req = sel.req
+    try:
+        return _select(db, sel, patch_text)
+    finally:
+        db.req = None
+
+
+def _select(db, sel, patch_text):
     fps = parse_patch(patch_text)
     for fp in fps:
         rels = {p for p in (fp.old_path, fp.new_path) if p}
@@ -287,6 +336,8 @@ def select(db: MapDB, patch_text: str) -> Selection:
             new = None
         if fp.new_path:
             sel.files[fp.new_path] = new
+        if fp.old_path and fp.old_path == fp.new_path and fp.old_path.startswith("tests/fixtures/"):
+            sel.fixture_texts[fp.old_path] = (old, new)
         if fp.old_path and fp.old_path != fp.new_path:
             sel.files[fp.old_path] = None
         v = 0
