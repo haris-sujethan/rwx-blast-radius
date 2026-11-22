@@ -56,6 +56,26 @@ def safe_for(files, req=None, execlines=None):
     return True
 
 
+def exec_rows(rel, repo):
+    """Indices of rows the executor test actually executes (meta 'execute'), read as text."""
+    import os
+
+    from units import pair_cases
+
+    text = open(os.path.join(repo, rel), encoding="utf-8").read()
+    out = []
+    for i, (sql, _exp) in enumerate(pair_cases(text)):
+        meta = {}
+        for line in sql.split("\n"):
+            if not line.startswith("#"):
+                break
+            k, _, v = line.partition(":")
+            meta[k.lstrip("#").strip()] = v.strip()
+        if meta.get("execute"):
+            out.append(i)
+    return out
+
+
 def fingerprints(rel, idxs=None):
     """{idx: hex} for executable rows of the fixture (all rows when idxs is None)."""
     from sqlglot import parse_one, serde, transpile
@@ -70,16 +90,19 @@ def fingerprints(rel, idxs=None):
     for i, (meta, sql, _expected) in enumerate(loader(fname)):
         if idxs is not None and i not in idxs:
             continue
-        if not meta.get("execute"):
-            continue
+        # every row is parsed and pickled to the pool, executed or not
         h = hashlib.sha1()
+        h.update(b"exec" if meta.get("execute") else b"noexec")
         try:
             e = pickle.loads(pickle.dumps(parse_one(sql)))
-            s = pickle.loads(pickle.dumps(schema))
-            opt = optimize(e, s, leave_tables_isolated=True, dialect=None)
-            h.update(json.dumps(serde.dump(opt), sort_keys=True, default=repr).encode())
-            h.update(b"\0")
-            h.update(transpile(sql, write="duckdb")[0].encode())
+            h.update(json.dumps(serde.dump(e), sort_keys=True, default=repr).encode())
+            if meta.get("execute"):
+                s = pickle.loads(pickle.dumps(schema))
+                opt = optimize(e, s, leave_tables_isolated=True, dialect=None)
+                h.update(b"\0")
+                h.update(json.dumps(serde.dump(opt), sort_keys=True, default=repr).encode())
+                h.update(b"\0")
+                h.update(transpile(sql, write="duckdb")[0].encode())
         except BaseException as ex:  # noqa: BLE001
             h.update(f"error:{type(ex).__name__}:{ex}".encode()[:500])
         out[i] = h.hexdigest()

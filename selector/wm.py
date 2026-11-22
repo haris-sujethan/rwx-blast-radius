@@ -193,14 +193,21 @@ def instrument(new_src: bytes, pairs, start_id=0):
             complete = False  # overlapping sites
             continue
         sid = start_id + i
-        head = f"_brwm_({sid}, lambda: ({old_txt}), lambda: (".encode()
-        tail = f"), {cond})".encode()
+        # once a site has shown a difference it is switched off: evaluate the new code directly
+        head = f"(_brwm_({sid}, lambda: ({old_txt}), lambda: (".encode()
+        mid = None
+        tail = f"), {cond}) if _brwm_on_[{sid}] else (".encode()
+        tail2 = b"))"
         if l0 == l1:
             ln = lines[l0]
-            lines[l0] = ln[:c0] + head + ln[c0:c1] + tail + ln[c1:]
+            seg = ln[c0:c1]
+            lines[l0] = ln[:c0] + head + seg + tail + seg + tail2 + ln[c1:]
         else:
+            # multi-line expression: keep line numbers, repeat the new text on its last line
+            seg_lines = [lines[l0][c0:]] + lines[l0 + 1:l1] + [lines[l1][:c1]]
+            flat = b" ".join(x.strip() for x in seg_lines)
             lines[l0] = lines[l0][:c0] + head + lines[l0][c0:]
-            lines[l1] = lines[l1][:c1] + tail + lines[l1][c1:]
+            lines[l1] = lines[l1][:c1] + tail + flat + tail2 + lines[l1][c1:]
         prev_start = (l0, c0)
         n_ok += 1
     out_src = b"\n".join(lines)
@@ -228,6 +235,8 @@ def __br_install():
         except Exception:
             return False
 
+    on = [True] * 4096
+
     def _brwm_(sid, old, new, cond):
         try:
             ov = old()
@@ -244,9 +253,12 @@ def __br_install():
         stats[0] += 1
         if oerr is not None or not _same(ov, nv, cond):
             stats[1] += 1
+            if 0 <= sid < len(on):
+                on[sid] = False
         return nv
 
     builtins._brwm_ = _brwm_
+    builtins._brwm_on_ = on
     return stats
 '''
 

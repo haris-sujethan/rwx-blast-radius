@@ -175,6 +175,27 @@ def child(test, outpath):
                         mon.restart_events()
             return wrapper
 
+        def unphase(fn):
+            def wrapper(*a, **k):
+                outer = state.get("exec")
+                state["exec"] = False
+                if outer:
+                    mon.restart_events()
+                try:
+                    return fn(*a, **k)
+                finally:
+                    state["exec"] = outer
+                    if outer:
+                        mon.restart_events()
+            return wrapper
+
+        import sqlglot.executor as sx
+
+        # engine phase = everything mp_execute does (find_tables, ensure_tables, schema,
+        # planning, execution) except the optimizer call, whose output the fingerprint covers
+        te.find_tables = phase(te.find_tables)
+        te.execute = phase(te.execute)
+        sx.optimize = unphase(sx.optimize)
         expy.PythonExecutor.execute = phase(expy.PythonExecutor.execute)
         planner.Plan.__init__ = phase(planner.Plan.__init__)
 

@@ -24,6 +24,9 @@ for root, dirs, files in os.walk(os.path.join(REPO, "sqlglot")):
     for f in files:
         if f.endswith(".py"):
             py_files.append(os.path.relpath(os.path.join(root, f), REPO))
+_dirs = os.environ.get("MUT_DIRS")
+if _dirs:
+    py_files = [f for f in py_files if any(f.startswith(d) for d in _dirs.split(","))]
 fixture_files = []
 for root, dirs, files in os.walk(os.path.join(REPO, "tests", "fixtures", "optimizer")):
     for f in files:

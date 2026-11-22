@@ -214,6 +214,34 @@ def wrap_helpers():
     h._br_wrapped = True
 
 
+def presetup_executor():
+    """Run TestExecutor.setUpClass once in the zygote (TPC data loading), with single-threaded
+    duckdb connections so forked children can use them; children skip it."""
+    te = sys.modules.get("tests.test_executor")
+    if te is None or getattr(te.TestExecutor, "_br_presetup", False):
+        return
+    try:
+        import duckdb
+
+        orig_connect = duckdb.connect
+
+        def connect(*a, **k):
+            cfg = dict(k.pop("config", None) or {})
+            cfg.setdefault("threads", 1)
+            return orig_connect(*a, config=cfg, **k)
+
+        te.duckdb.connect = connect
+        try:
+            te.TestExecutor.setUpClass()
+        finally:
+            te.duckdb.connect = orig_connect
+        te.TestExecutor.setUpClass = classmethod(lambda cls: None)
+        te.TestExecutor.tearDownClass = classmethod(lambda cls: None)
+        te.TestExecutor._br_presetup = True
+    except BaseException as e:  # noqa: BLE001
+        print(f"executor presetup failed: {e!r}", file=sys.stderr)
+
+
 def preload(modules):
     for m in modules:
         try:

@@ -118,6 +118,8 @@ def main():
     try:
         from units import FULL, SKIP, UnitDB
 
+        if os.environ.get("BR_NO_UNITS") == "1":
+            raise RuntimeError("unit filtering disabled")
         udb = UnitDB(UNITS)
     except Exception as e:  # noqa: BLE001
         log(f"no unit map: {e!r}")
@@ -248,8 +250,14 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
 
     pending = sorted(((level(sel.files), cid, sel, cheap, exp) for cid, sel, cheap, exp in jobs),
                      key=lambda j: j[0])
+    tpc_exec = {}
     try:
         tpc_orig = json.load(open(TPCFP))
+        import tpcfp as _tf
+
+        tpc_exec = {rel: set(_tf.exec_rows(rel, REPO)) for rel in (_tf.TPCH, _tf.TPCDS)}
+        if os.environ.get("BR_NO_TPC") == "1":
+            tpc_orig = None
     except OSError:
         tpc_orig = None
 
@@ -273,7 +281,8 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             idxs &= set(orig)
             base = pack_cost(fail, dur_ms)
             marginal = (pack_cost(fail | {n}, dur_ms) - base) / 1000
-            est_fp = 0.07 * CPU_SCALE * len(idxs) + 0.3
+            n_exec = sum(1 for i in idxs if i in tpc_exec.get(rel, ()))
+            est_fp = (0.06 * n_exec + 0.006 * (len(idxs) - n_exec)) * CPU_SCALE + 0.3
             if est_fp >= marginal:
                 continue
             res = runner.run_func(tpcfp.fingerprints, (rel, sorted(idxs)), purge=purge,
@@ -365,7 +374,7 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 unrun = set(cheap)
             elif cheap:
                 res = runner.run_tests(spec_of(cheap, sel, E), purge=purge, stop_cb=stop_cb,
-                                       timeouts={n: max(3.0, E(n) * 4 + 2) for n in cheap},
+                                       timeouts={n: max(4.0, E(n) * 5 + 3) for n in cheap},
                                        deadline=deadline, filters=sel.filters)
                 failing |= {n for n, f in res.items() if f}
                 unrun = cheap - set(res)
@@ -384,7 +393,7 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 blind |= b
                 if run_b:
                     res = runner.run_tests(spec_of(run_b, sel, E), purge=purge,
-                                           timeouts={n: max(3.0, E(n) * 4 + 2) for n in run_b},
+                                           timeouts={n: max(4.0, E(n) * 5 + 3) for n in run_b},
                                            deadline=deadline, filters=sel.filters)
                     failing |= {n for n, f in res.items() if f} | {n for n in run_b if n not in res}
         finally:
@@ -408,6 +417,10 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 mods = [m for m in mods if m in need]
             runner.preload(mods)
             cur_level += 1
+            if "tests.test_executor" in mods and any(
+                    lv >= cur_level and any(modname(n) == "tests.test_executor" for n in ch)
+                    for lv, _, _, ch, _ in pending):
+                runner.presetup_executor()
         try:
             serve(cid, sel, cheap, expensive, lvl)
         except Exception as e:  # noqa: BLE001
