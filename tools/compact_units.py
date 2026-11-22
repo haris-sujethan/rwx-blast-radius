@@ -63,6 +63,7 @@ for f in glob.glob(f"{units_dir}/*.json"):
         "classes": {c: sid(v) for c, v in classes.items()},
         "nl": {fn: frozenset(ls) for fn, ls in r["nonunit"]["lines"].items()},
         "nc": frozenset(r["nonunit"]["classes"]),
+        "execlines": {fn: frozenset(ls) for fn, ls in r.get("execlines", {}).items()},
     }
 
 implines = {}

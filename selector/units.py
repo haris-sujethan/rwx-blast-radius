@@ -124,17 +124,19 @@ class UnitDB:
         if bits:
             explained = True
         units = u["units"]
+        counts = u.get("counts", {})
         for rel in req["fixtures"]:
             idxs = [k for k, (r, _) in enumerate(units) if r == rel]
-            if not idxs:
-                continue
+            total = counts.get(rel)
+            if total is None:
+                continue  # the test never iterates this fixture's rows
             texts = fixture_texts.get(rel)
             if texts is None:
                 return FULL, 1.0
-            changed = changed_cases(texts[0], texts[1], u.get("counts", {}).get(rel, len(idxs)))
+            changed = changed_cases(texts[0], texts[1], total)
             if changed is None:
                 return FULL, 1.0
-            explained = True
+            explained = True  # rows the test loads but never works on cannot affect it
             for pos in idxs:
                 if units[pos][1] in changed:
                     bits |= 1 << pos

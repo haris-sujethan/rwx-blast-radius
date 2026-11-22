@@ -20,4 +20,4 @@ RUN python -m compileall -q -j 0 /app/repo/sqlglot /app/repo/tests /app/selector
  && chmod -R a+rX /app
 
 ENV BR_REPO=/app/repo BR_STAGES=/app/stages.json
-CMD ["python", "/app/selector/diag.py"]
+CMD ["python", "/app/selector/main.py"]

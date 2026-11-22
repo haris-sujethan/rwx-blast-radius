@@ -22,7 +22,7 @@ EXEC_TPC = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": "tests/f
 STAGES = os.environ.get("BR_STAGES", "/app/stages.json")
 MIRROR = os.environ.get("BR_MIRROR", "/tmp/m")
 WALL_BUDGET = float(os.environ.get("BR_WALL", "140"))
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.3"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "2.4"))
 CHEAP_MAX = float(os.environ.get("BR_CHEAP_MAX", "1.5"))
 RUN_CAP = float(os.environ.get("BR_RUN_CAP", "20"))
 WORKER_MS = 2000
@@ -206,11 +206,30 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
     def modname(n):
         return tid[n].split("::")[0][:-3].replace("/", ".")
 
-    def spec_of(nums):
-        out = []
-        for n in sorted(nums):
+    def spec_of(nums, sel=None, E=None):
+        """Run order: tests whose file matches a patched module first (most likely to fail, so
+        an early failure can stop the run), then cheapest first; one class kept together."""
+        toks = set()
+        for f in (sel.files if sel is not None else ()):
+            b = os.path.basename(f).rsplit(".", 1)[0]
+            if b not in ("__init__", "dialect", "parser", "generator", "core"):
+                toks.add(b.lower())
+        groups = {}
+        for n in nums:
             parts = tid[n].split("::")
-            out.append((n, parts[0][:-3].replace("/", "."), parts[1], parts[-1]))
+            key = (parts[0], parts[1])
+            groups.setdefault(key, []).append(n)
+
+        def gkey(item):
+            (path, cls), ns = item
+            aff = any(t in path.lower() for t in toks)
+            cost = sum((E(n) if E else 0.0) for n in ns)
+            return (0 if aff else 1, cost)
+
+        out = []
+        for (path, cls), ns in sorted(groups.items(), key=gkey):
+            for n in sorted(ns, key=lambda n: (E(n) if E else 0.0, n)):
+                out.append((n, path[:-3].replace("/", "."), cls, tid[n].split("::")[-1]))
         return out
 
     need_heavy = any(modname(n) in ("tests.test_optimizer", "tests.test_executor")
@@ -239,11 +258,14 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
         import tpcfp
 
         udb = STATE.get("udb")
-        if tpc_orig is None or not tpcfp.safe_for(sel.files):
+        if tpc_orig is None:
             return
         for n in list(expensive):
             rel = EXEC_TPC.get(tid[n])
             if rel is None:
+                continue
+            ut = udb.tests.get(tid[n]) if udb is not None else None
+            if not tpcfp.safe_for(sel.files, sel.req, ut.get("execlines") if ut else None):
                 continue
             orig = {int(k): v for k, v in tpc_orig.get(rel, {}).items()}
             flt = sel.filters.get(n)
@@ -283,11 +305,11 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             return
         est_cheap = sum(E(n) for n in cheap)
         blind_all = pack_cost(cheap | expensive, dur_ms) / 1000
+        skip_cheap = False
         if est_cheap > min(blind_all + 1.0, RUN_CAP):
             log(f"{cid}: running cheap tests ({est_cheap:.1f}s) costs more than including "
-                f"everything ({blind_all:.1f}s); blind")
-            emit(cid, cheap | expensive)
-            return
+                f"everything ({blind_all:.1f}s); cheap ones blind")
+            skip_cheap = True
         deadline = min(T0 + WALL_BUDGET, now + max(15.0, 3 * est_cheap + 10))
         files = dict(sel.files)
         files.update(sel.instr)
@@ -300,8 +322,13 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
             import tpcfp
 
             tpc_maybe = set()
-            if tpc_orig is not None and tpcfp.safe_for(sel.files):
-                tpc_maybe = {n for n in expensive if tid[n] in EXEC_TPC}
+            if tpc_orig is not None:
+                udb_ = STATE.get("udb")
+                for n in expensive:
+                    if tid[n] in EXEC_TPC:
+                        ut = udb_.tests.get(tid[n]) if udb_ is not None else None
+                        if tpcfp.safe_for(sel.files, sel.req, ut.get("execlines") if ut else None):
+                            tpc_maybe.add(n)
 
             def plan_expensive(fail, exclude=()):
                 blind_, run_ = set(), set()
@@ -334,8 +361,10 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 return marginal <= 0.8 * sum(E(m) for m in rest)
 
             unrun = set()
-            if cheap:
-                res = runner.run_tests(spec_of(cheap), purge=purge, stop_cb=stop_cb,
+            if skip_cheap:
+                unrun = set(cheap)
+            elif cheap:
+                res = runner.run_tests(spec_of(cheap, sel, E), purge=purge, stop_cb=stop_cb,
                                        timeouts={n: max(3.0, E(n) * 4 + 2) for n in cheap},
                                        deadline=deadline, filters=sel.filters)
                 failing |= {n for n, f in res.items() if f}
@@ -354,7 +383,7 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
                 b, run_b = plan_expensive(failing | unrun)
                 blind |= b
                 if run_b:
-                    res = runner.run_tests(spec_of(run_b), purge=purge,
+                    res = runner.run_tests(spec_of(run_b, sel, E), purge=purge,
                                            timeouts={n: max(3.0, E(n) * 4 + 2) for n in run_b},
                                            deadline=deadline, filters=sel.filters)
                     failing |= {n for n, f in res.items() if f} | {n for n in run_b if n not in res}
@@ -371,7 +400,13 @@ def execute(jobs, tid, est_cpu, dur_ms, emit):
     cur_level = 0
     for lvl, cid, sel, cheap, expensive in pending:
         while cur_level < lvl:
-            runner.preload(stages[cur_level]["modules"])
+            mods = stages[cur_level]["modules"]
+            if cur_level == len(stages) - 1:
+                # last stage = test modules: only those the remaining commits will run
+                need = {modname(n) for lv, _, _, ch, ex in pending if lv >= cur_level + 1
+                        for n in ch | ex}
+                mods = [m for m in mods if m in need]
+            runner.preload(mods)
             cur_level += 1
         try:
             serve(cid, sel, cheap, expensive, lvl)

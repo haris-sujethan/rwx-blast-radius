@@ -38,6 +38,8 @@ def child(test, outpath):
     units = {}
     state = {"cur": nonunit, "unit": None, "active": False}
 
+    execlines = {}
+
     def on_line(code, line):
         if state["active"] and code.co_flags & 1:
             fn = code.co_filename
@@ -47,6 +49,8 @@ def child(test, outpath):
                 if s is None:
                     s = d[fn] = set()
                 s.add(line)
+                if state.get("exec"):
+                    execlines.setdefault(fn, set()).add(line)
         return mon.DISABLE
 
     mon.register_callback(tool, mon.events.LINE, on_line)
@@ -154,6 +158,25 @@ def child(test, outpath):
 
     if "test_executor" in test["id"]:
         import tests.test_executor as te
+        from sqlglot import planner
+        from sqlglot.executor import python as expy
+
+        def phase(fn):
+            def wrapper(*a, **k):
+                outer = state.get("exec")
+                state["exec"] = True
+                if not outer:
+                    mon.restart_events()
+                try:
+                    return fn(*a, **k)
+                finally:
+                    state["exec"] = outer
+                    if not outer:
+                        mon.restart_events()
+            return wrapper
+
+        expy.PythonExecutor.execute = phase(expy.PythonExecutor.execute)
+        planner.Plan.__init__ = phase(planner.Plan.__init__)
 
         orig_setup = te.TestExecutor.setUpClass.__func__
 
@@ -210,7 +233,8 @@ def child(test, outpath):
     rec = {"n": test["number"], "id": test["id"], "rc": int(rc), "failed": bool(outcome.get("failed")),
            "nonunit": conv(nonunit),
            "units": [[k[0], k[1], conv(v), times.get(k, 0.0)] for k, v in units.items()],
-           "nonunit_time": times.get(None, 0.0)}
+           "nonunit_time": times.get(None, 0.0),
+           "execlines": {os.path.relpath(f, REPO): sorted(v) for f, v in execlines.items()}}
     with open(outpath, "w") as f:
         json.dump(rec, f)
 

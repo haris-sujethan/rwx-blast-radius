@@ -27,10 +27,32 @@ UNSAFE_PREFIXES = (
 )
 
 
-def safe_for(files):
+SAFE_FIXTURES = ("tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
+
+
+ENGINE = ("sqlglot/executor/", "sqlglot/planner.py")
+
+
+def safe_for(files, req=None, execlines=None):
+    """True when the engine (planner + executor run) cannot behave differently for an
+    unchanged fingerprint: engine files untouched and, given the recorded lines the engine
+    phase executes, no changed line runs inside it."""
     for f in files:
-        if not f.startswith("sqlglot/") or f.startswith(UNSAFE_PREFIXES):
+        if f.startswith(SAFE_FIXTURES):
+            continue  # the fingerprint re-reads the (patched) fixture rows
+        if not f.startswith("sqlglot/"):
             return False
+        if f.startswith(ENGINE):
+            return False
+        if execlines is None and f.startswith(UNSAFE_PREFIXES):
+            return False
+    if execlines is not None:
+        if req is None or req["full"] or req["classes"] or req.get("conj"):
+            return False
+        for rel, lines in req["lines"].items():
+            el = execlines.get(rel)
+            if el and not el.isdisjoint(lines):
+                return False
     return True
 
 

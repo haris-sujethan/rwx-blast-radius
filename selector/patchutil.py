@@ -38,6 +38,27 @@ class FilePatch:
         return removed, inserted_after
 
 
+def touched_lines(fp):
+    """(old_touched, new_touched): line numbers changed or adjacent to an edit, per side."""
+    old_t, new_t = set(), set()
+    for old_start, _ol, new_start, _nl, lines in fp.hunks:
+        o, n = old_start, new_start
+        for ln in lines:
+            tag = ln[:1]
+            if tag == " ":
+                o += 1
+                n += 1
+            elif tag == "-":
+                old_t.add(o)
+                new_t.add(n)
+                o += 1
+            elif tag == "+":
+                new_t.add(n)
+                old_t.add(o)
+                n += 1
+    return old_t, new_t
+
+
 def _strip_prefix(p):
     p = p.split("\t")[0].strip()
     if p == "/dev/null":

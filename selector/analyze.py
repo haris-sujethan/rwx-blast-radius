@@ -146,8 +146,28 @@ def _lambda_only_diff(o, n):
 
 
 class Differ:
-    def __init__(self, impact: Impact):
+    def __init__(self, impact: Impact, okey=None, nkey=None):
         self.im = impact
+        self.okey = okey  # raw-source key (cheap); None -> AST dumps only
+        self.nkey = nkey
+
+    def opcodes(self, old, new):
+        """Statement alignment: raw source first (cheap), AST dumps inside differing regions."""
+        if self.okey is None:
+            od = [_dump(s) for s in old]
+            nd = [_dump(s) for s in new]
+            yield from SequenceMatcher(None, od, nd, autojunk=False).get_opcodes()
+            return
+        ok = [self.okey(s) for s in old]
+        nk = [self.nkey(s) for s in new]
+        for tag, i1, i2, j1, j2 in SequenceMatcher(None, ok, nk, autojunk=False).get_opcodes():
+            if tag == "equal":
+                yield tag, i1, i2, j1, j2
+                continue
+            od = [_dump(s) for s in old[i1:i2]]
+            nd = [_dump(s) for s in new[j1:j2]]
+            for t2, a1, a2, b1, b2 in SequenceMatcher(None, od, nd, autojunk=False).get_opcodes():
+                yield t2, i1 + a1, i1 + a2, j1 + b1, j1 + b2
 
     # ---- function scope -------------------------------------------------
     def mark(self, node):
@@ -160,12 +180,7 @@ class Differ:
             self.im.spans.append(_span(s))
 
     def fn_block(self, old, new, parent_span=None):
-        od = [_dump(s) for s in old]
-        nd = [_dump(s) for s in new]
-        if od == nd:
-            return
-        sm = SequenceMatcher(None, od, nd, autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        for tag, i1, i2, j1, j2 in self.opcodes(old, new):
             if tag == "equal":
                 continue
             if tag == "replace" and (i2 - i1) == (j2 - j1):
@@ -239,12 +254,7 @@ class Differ:
 
     # ---- class scope ------------------------------------------------------
     def class_block(self, old, new, q):
-        od = [_dump(s) for s in old]
-        nd = [_dump(s) for s in new]
-        if od == nd:
-            return
-        sm = SequenceMatcher(None, od, nd, autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        for tag, i1, i2, j1, j2 in self.opcodes(old, new):
             if tag == "equal":
                 continue
             if tag == "replace" and (i2 - i1) == (j2 - j1):
@@ -295,10 +305,7 @@ class Differ:
 
     # ---- module scope -----------------------------------------------------
     def module(self, old, new):
-        od = [_dump(s) for s in old]
-        nd = [_dump(s) for s in new]
-        sm = SequenceMatcher(None, od, nd, autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        for tag, i1, i2, j1, j2 in self.opcodes(old, new):
             if tag == "equal":
                 continue
             if tag == "replace" and (i2 - i1) == (j2 - j1):
@@ -395,7 +402,21 @@ class Differ:
         self.module_stmt_change(o, n)
 
 
-def analyze_python(path, modname, old_src, new_src) -> Impact:
+def _keyer(src):
+    """Raw source of a statement (decorators included): equal text implies equal AST."""
+    lines = src.split(b"\n")
+
+    def key(st):
+        a = st.lineno
+        if getattr(st, "decorator_list", None):
+            a = min([a] + [d.lineno for d in st.decorator_list])
+        b = st.end_lineno or st.lineno
+        return (st.col_offset, b"\n".join(lines[a - 1:b]))
+
+    return key
+
+
+def analyze_python(path, modname, old_src, new_src, old_touched=None, new_touched=None) -> Impact:
     im = Impact(path, modname)
     try:
         old_tree = ast.parse(old_src) if old_src is not None else None
@@ -415,9 +436,7 @@ def analyze_python(path, modname, old_src, new_src) -> Impact:
         im.notes.append("new file")
         im.names.add(modname.rsplit(".", 1)[-1])
         return im
-    if _dump(old_tree) == _dump(new_tree):
-        return im
-    Differ(im).module(old_tree.body, new_tree.body)
+    Differ(im, _keyer(old_src), _keyer(new_src)).module(old_tree.body, new_tree.body)
     if im.classes or im.names or im.importers or im.syntax_error:
         im.exotic = True
     return im

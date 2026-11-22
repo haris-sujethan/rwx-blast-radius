@@ -10,7 +10,7 @@ import zlib
 
 import wm
 from analyze import analyze_python
-from patchutil import apply, parse_patch
+from patchutil import apply, parse_patch, touched_lines
 
 CONST_RE = re.compile(r"_?[A-Z][A-Z0-9_]*")
 IGNORED_OPENS = {"pyproject.toml", "setup.cfg", "tests", "tests/dialects"}
@@ -352,9 +352,11 @@ def _select(db, sel, patch_text):
         if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
             if fp.old_path and fp.new_path and fp.old_path != fp.new_path:
                 v |= db.importers(fp.old_path) | db.name_refs({modname_of(fp.old_path).rsplit(".", 1)[-1]})
+            ot, nt = touched_lines(fp)
             im = analyze_python(rel, modname_of(rel),
                                 old.encode("utf-8", "surrogateescape") if old is not None else None,
-                                new.encode("utf-8", "surrogateescape") if new is not None else None)
+                                new.encode("utf-8", "surrogateescape") if new is not None else None,
+                                ot, nt)
             sel.notes.append(repr(im))
             if im.exotic or v:
                 # exotic change, or the file is also read as data by some test
